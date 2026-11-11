@@ -1,0 +1,8 @@
+{
+  "id": "hud-marker-controls",
+  "kind": "native",
+  "version": "0.1.0",
+  "backlog": "I12",
+  "feature_dependencies": [],
+  "gameplay": true
+}
