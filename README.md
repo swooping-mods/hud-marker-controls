@@ -1,5 +1,7 @@
 # Hud Marker Controls
 
+<img src="media/icon.png" alt="Hud Marker Controls icon" width="128" height="128">
+
 Map controls for service HUD marker types, range and distance labels.
 
 ## Install
