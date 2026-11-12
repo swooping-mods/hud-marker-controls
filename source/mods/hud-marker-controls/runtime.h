@@ -1,5 +1,6 @@
 /* Each feature owns a copy: there are no runtime feature-mod dependencies. */
 #include "../../runtime/native/gameplay.h"
+#include "../../runtime/native/local_actor.h"
 #include "api.h"
 #include "../../runtime/native/input.h"
 #include "../../runtime/sdk/mapping_unity.h"
@@ -18,7 +19,8 @@ static struct {
  int owned,shop,active_tool,invalid_store,dirty,ready,authority_lost;char root[192];unsigned char known[128];
  const char *status;float next_scan,time;PTR log;
 } m;
-static inline int malive(PTR obj){if(!obj)return 0;int ok=1;void *a[]={obj};PTR v=call(m.alive,0,a,&ok);return ok&&v&&*(unsigned char*)unbox(v);}
+static inline int malive_checked(PTR obj,int *ok){if(!obj)return 0;void *a[]={obj};PTR v=call(m.alive,0,a,ok);if(!v||!unbox(v)){*ok=0;return 0;}return *ok&&*(unsigned char*)unbox(v);}
+static inline int malive(PTR obj){int ok=1;return malive_checked(obj,&ok);}
 
 static inline void mevent(const char *s){if(!m.log)return;char b[256],*p=cat(b,"{\"event\":\"");p=cat(p,s);p=cat(p,"\"}\n");DWORD n=0;WriteFile(m.log,b,(DWORD)(p-b),&n,0);}
 static inline PTR mm(const char *ns,const char *type,const char *name,const char *sig){return dmethod(ns,type,name,sig);}
@@ -45,41 +47,49 @@ static inline int ui(void){
  int size=16,align=0;mset(m.font_size,text,&size);mset(m.alignment,text,&align);DColor fg={.92f,.93f,.94f,1};mset(m.color,text,&fg);mset(m.raycast,text,&no);
  return ok;
 }
-static inline void show(const char *text,int visible){if(!ui())return;unsigned char yes=(unsigned char)visible;mset(m.active,dget(m.ui),&yes);if(visible){int ok=1;void *a[]={da.string(text)};call(m.text,dget(m.label),a,&ok);}}
+static inline void show(const char *text,int visible){if(!visible&&!m.ui)return;if(!ui())return;unsigned char yes=(unsigned char)visible;mset(m.active,dget(m.ui),&yes);if(visible){int ok=1;void *a[]={da.string(text)};call(m.text,dget(m.label),a,&ok);}}
 static inline unsigned balance(PTR world,PTR player,int *ok){void *a[]={player};DRoot value=dhold(call(m.wallet,world,a,ok));void *b[]={value?unbox(dget(value)):0};PTR number=b[0]?call(m.decimal_int,0,b,ok):0;int n=number?*(int*)unbox(number):-1;if(n<0)*ok=0;ddrop(&value);return n<0?0:(unsigned)n;}
 typedef struct {PTR world,player;} MappingWalletContext;
 static inline int mapping_balance(void *context,long long *amount){MappingWalletContext *c=context;int ok=1;*amount=balance(c->world,c->player,&ok);return ok;}
 static inline int mapping_adjust(void *context,int delta){MappingWalletContext *c=context;int ok=1;unsigned char decimal[16]={0};void *a[]={&delta};call(m.decimal_ctor,decimal,a,&ok);void *b[]={c->player,decimal};if(ok)call(m.charge,c->world,b,&ok);return ok;}
 static inline int debit(int price){int ok=1;PTR id=call(m.player,0,0,&ok);DRoot player=dhold(id);if(!ok||!player){ddrop(&player);return 0;}MappingWalletContext context={dget(m.world),dget(player)};const MoonWallet wallet={mapping_balance,mapping_adjust};int result=mw_debit(&wallet,&context,price,0);ddrop(&player);return result==MW_PAID;}
-static inline void save(void){if(!m.dirty||!m.root[0]||!host()||m.authority_lost)return;unsigned char b[136]={0x4d,0x4d,0x01,FEATURE};b[4]=(unsigned char)m.owned;dcopy(b+8,m.known,128);if(ss_save(m.root,b,sizeof(b))){m.dirty=0;}else m.status="Save pending; do not buy again";}
-static inline void load(void){int ok=1;PTR value=call(m.save_root,dget(m.world),0,&ok);if(!ok||!value)return;int n=((int(*)(PTR))GetProcAddress(GetModuleHandleA("GameAssembly.dll"),"il2cpp_string_length"))(value);const unsigned short *s=((const unsigned short *(*)(PTR))GetProcAddress(GetModuleHandleA("GameAssembly.dll"),"il2cpp_string_chars"))(value);if(n<1||n>180)return;for(int i=0;i<n;i++){if(s[i]>127)return;m.root[i]=(char)s[i];}m.root[n]=0;
- unsigned char b[136];unsigned length=0;if(ss_load(m.root,b,sizeof(b),&length)){if(length!=sizeof(b)||b[0]!=0x4d||b[1]!=0x4d||b[2]!=1||b[3]!=FEATURE||b[4]>1){m.invalid_store=1;return;}m.owned=b[4];dcopy(m.known,b+8,128);}else if(ss.last_error!=SS_NOT_FOUND)m.invalid_store=1;
-}
+#include "settings.h"
 static inline void purchase(int price){if(m.owned||m.invalid_store||!m.root[0]||!host()||m.authority_lost)return;if(debit(price)){m.owned=1;m.dirty=1;m.status="Purchased";save();mevent("purchase");}else m.status="Insufficient funds or unavailable";}
 static inline PTR map(void){int ok=1;PTR screen=moon_map_screen(&m.mapping,dget(m.walker),&ok);return ok&&malive(screen)?screen:0;}
 static inline int mapopen(PTR screen){return moon_map_open(&m.mapping,screen);}
 static inline int known(int index){return moon_map_known(m.known,sizeof(m.known),index);}
 static inline DVec direction(PTR world,int index,int *ok){MoonMapPoint p=moon_map_direction(&m.mapping,world,index,ok);return (DVec){p.x,p.y,p.z};}
 static inline float radius(PTR world){return moon_map_radius(&m.mapping,world);}
+#include "input_gate.h"
 static void feature_end(void);
 static void feature_tick(PTR walker,PTR world,int input);
-static int update(int id,Context *context){(void)id;if(!m.thread)m.thread=GetCurrentThreadId();if(m.thread!=GetCurrentThreadId())return 0;int ok=1;int frame=integer(m.frame,0,&ok);if(!ok||frame==m.last_frame)return 0;m.last_frame=frame;
- PTR walker=(PTR)context->rcx,world=0;field_value(walker,m.world_field,&world);
- if(!malive(world)||world!=dget(m.world)||walker!=dget(m.walker)){
-  save();feature_end();destroy_root(&m.ui);ddrop(&m.label);ddrop(&m.map);ddrop(&m.world);ddrop(&m.walker);m.root[0]=0;m.owned=m.shop=m.active_tool=m.invalid_store=m.dirty=m.authority_lost=0;dzero(m.known,sizeof(m.known));m.status="";m.next_scan=0;
-  if(!malive(world))return 0;m.world=dhold(world);m.walker=dhold(walker);if(host())load();
- }
- if(boolean(m.restoring,world,&ok)||!ok){show("",0);return 0;}
- if(!host())m.authority_lost=1;
+static int update(int id,Context *context){
+ (void)id;DWORD thread=GetCurrentThreadId();if(m.thread&&m.thread!=thread)return 0;
+ PTR walker=(PTR)context->rcx;if(!moon_local_actor_admit(walker))return 0;if(!m.thread)m.thread=thread;
+ int ok=1,frame=integer(m.frame,0,&ok);if(!ok||frame==m.last_frame)return 0;m.last_frame=frame;
+ /* Consume edges even while restoring, replacing a world, or denying input. */
  moon_input_snapshot(m.down,m.pressed);
 #ifdef MOD_INPUT_ACTIONS
  static const MoonInputAlias input_actions[]=MOD_INPUT_ACTIONS;
  moon_input_alias_edges(input_actions,sizeof(input_actions)/sizeof(*input_actions),m.pressed,1);
 #endif
- int input=boolean(m.focused,0,&ok)&&!boolean(m.typing,0,&ok)&&!boolean(m.menu,walker,&ok)&&ok;
+ PTR world=0;field_value(walker,m.world_field,&world);
+ if(!malive(world)||world!=dget(m.world)||walker!=dget(m.walker)){
+  save();feature_end();destroy_root(&m.ui);ddrop(&m.label);ddrop(&m.map);ddrop(&m.world);ddrop(&m.walker);m.root[0]=0;m.owned=m.shop=m.active_tool=m.invalid_store=m.dirty=m.authority_lost=0;dzero(m.known,sizeof(m.known));dzero(m.pressed,sizeof(m.pressed));m.status="";m.next_scan=0;
+  if(!malive(world))return 0;m.world=dhold(world);m.walker=dhold(walker);if(!m.world||!m.walker){ddrop(&m.world);ddrop(&m.walker);return 0;}
+ }
+ if(!host())m.authority_lost=1;
+ if(boolean(m.restoring,world,&ok)||!ok){m.shop=0;feature_end();show("",0);return 0;}
+ /* SaveDirectory can arrive after world adoption/restoration. Keep sampling
+  * edges and retry the root before allowing edits to overwrite loaded state. */
+ if(!m.authority_lost&&!m.root[0]){
+  load();dzero(m.pressed,sizeof(m.pressed));
+  if(!m.root[0]){m.shop=0;feature_end();show("",0);return 0;}
+ }
+ int focused=boolean(m.focused,0,&ok),typing=boolean(m.typing,0,&ok);
+ int input=ok&&hud_map_input_allowed(walker,focused,typing);
  m.time=dnumber(mm("UnityEngine","Time","get_unscaledTime",""),0,&ok);
- if(moon_shop_poll()&&input){m.shop=1;m.status="";}
- if(!input){m.shop=0;show("",0);return 0;}
+ if(!ok||!(m.time>=0&&m.time<1e10f)){m.shop=0;feature_end();show("",0);return 0;}
  feature_tick(walker,world,input);if(m.dirty&&m.time>=m.next_scan+2)save();return 0;
 }
 static int bind(PTR game){
@@ -93,6 +103,6 @@ static int bind(PTR game){
  B(text,"UnityEngine.UI","Text","set_text","System.String");B(font,"UnityEngine.UI","Text","set_font","UnityEngine.Font");B(font_size,"UnityEngine.UI","Text","set_fontSize","System.Int32");B(color,"UnityEngine.UI","Graphic","set_color","UnityEngine.Color");B(raycast,"UnityEngine.UI","Graphic","set_raycastTarget","System.Boolean");B(alignment,"UnityEngine.UI","Text","set_alignment","UnityEngine.TextAnchor");B(image_color,"UnityEngine.UI","Graphic","set_color","UnityEngine.Color");
 
 #undef B
- m.world_field=get_field(find_class("MoonCleaners","MoonWalker"),"world");return m.world_field&&moon_map_bind(&m.mapping)&&ss_bind();
+ m.world_field=get_field(find_class("MoonCleaners","MoonWalker"),"world");return m.world_field&&moon_local_actor_bind()&&moon_map_bind(&m.mapping)&&hud_map_input_bind()&&ss_bind();
 }
 __declspec(dllexport) int MoonLab_ModStart(PTR domain,PTR game){if(!bind_runtime(domain,game)||!dapi(game)||!bind(game))return 0;char path[1024];DWORD n=GetEnvironmentVariableA("MOONLAB_EVIDENCE",path,900);if(n&&n<900){cat(path+n,"\\" MOD_ID ".jsonl");m.log=CreateFileA(path,0x40000000,1,0,1,0x80,0);}if(FEATURE==8||FEATURE==15||FEATURE==23)moon_shop_listen(MOD_ID);m.last_frame=-1;before_hook=update;if(!prepare_hook(method("MoonCleaners","MoonWalker","Update",0),100671733,0,game)||!install_hooks()){moon_shop_unlisten();return 0;}mevent("ready-testing-deferred");return 1;}
